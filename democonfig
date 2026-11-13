@@ -1,0 +1,23 @@
+# Demo configuration: short timers so a full game finishes quickly and is
+# easy to screenshot. Uses a local socket so you can run it as ONE user
+# (no install needed) to capture gameplay, then do a "real" multi-user run
+# with cultconfig if you want.
+sockPath=/tmp/cult.sock
+logDir=./demo-log
+minPlayers=5
+joinTime=12
+nightTime=15
+dayTalkTime=15
+dayVoteTime=15
+maxRounds=6
+numInvestigators=1
+numSkeptics=1
+cultWinFraction=0.5
+randomRoles=1
+
+# ---- Project 2/3 hardening (OFF for the single-user bot demo) ----
+# The demo runs many bots as ONE Linux user, so UID enforcement and the
+# one-per-UID rule must stay off, and the socket stays broadly reachable.
+enforceUids=0
+onePerUid=0
+socketMode=0777

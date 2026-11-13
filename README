@@ -1,0 +1,152 @@
+===========================================================================
+ THE CULT  --  Project 2/3 (hardened + isolated)
+ A hidden-role social-deduction game over UNIX stream sockets, with a
+ cgroups-v2 + seccomp isolation sandbox for players.
+ Author: Abhishek Singh
+ Course: CSE/CEN Advanced Operating Systems, Arizona State University, Fall 2026
+===========================================================================
+
+WHAT THIS IS
+------------
+The Cult is a text-based, Werewolves-style game for a Linux machine. Each
+player is a separate Linux user running a client process; a single server
+process (the "Prophet") runs the game. A hidden Cult Leader CONVERTS players
+one at a time; converted players secretly join a growing multicast "cult
+channel" while keeping up appearances in the public day chat. Nobody is ever
+eliminated, so a connection stays open for the whole game.
+
+Project 1 used UNIX domain stream sockets multiplexed with a selectors/epoll
+event loop. For Projects 2/3 the game is improved in two ways that answer the
+security and robustness feedback classmates gave on Project 1:
+
+  (A) The communications library was HARDENED (see cultnet.py): the event
+      loop is now fully non-blocking, oversized/slow frames can no longer
+      hang the server, and the kernel-verified UID is used as an access
+      control gate (allowlist + one-connection-per-UID + 0660 socket).
+
+  (B) A NEW ISOLATION MECHANISM was added (see cultsandbox.py): each player
+      runs inside a cgroups-v2 control group (CPU/memory/pids caps) and under
+      a seccomp-BPF syscall filter, so one malicious player cannot crash the
+      server, starve the machine, or escape to run arbitrary programs.
+
+THE COMMUNICATIONS LIBRARY (single file):   cultnet.py
+
+
+FILES
+-----
+  cultnet.py       THE communications library (single file). UNIX stream
+                   sockets + selectors/epoll + length-prefixed JSON framing +
+                   SO_PEERCRED. Project 2/3 adds the non-blocking reader,
+                   frame-size cap, slowloris timeout, UID allowlist,
+                   one-per-UID, and 0660 socket mode.
+  cultsandbox.py   THE NEW ISOLATION MECHANISM. A launcher that wraps a
+                   player in a cgroup v2 (cpu.max/memory.max/pids.max) and a
+                   raw seccomp-BPF syscall filter, then runs the client
+                   in-process. Also hosts built-in attack "victims" for
+                   testing (--victim cpuhog|memhog|forkbomb|execshell|ptrace).
+  cultserver.py    The game server / moderator. Unchanged game logic; now
+                   passes the allowlist / one-per-UID / socket mode to the
+                   library from the config.
+  cultclient.py    The player client (unchanged).
+  cultbot.py       Automated bot player, for the headless demo.
+  cultconfig       Server config (timers, roles, and the P2/P3 hardening
+                   flags enforceUids / onePerUid / socketMode).
+  democonfig       Config for the single-user bot demo (hardening off).
+  install.sh       Full install: cultmaster + player users, the 'cult' group,
+                   the UID allowlist, and the delegated cgroup parent.
+  setup_cgroups.sh Prepares /sys/fs/cgroup/cult (run as root; re-run after a
+                   reboot since cgroup settings are not persistent).
+  mkplayer.sh      Creates one playerN user, adds it to 'cult', installs the
+                   client + library + sandbox.
+  makeplayers.py   Creates player0..playerN-1 (calls mkplayer.sh).
+  uninstall.sh     Removes the users this created.
+  measure.py       Runs the attacks with/without caps and writes CSVs
+                   (cpu.csv, mem.csv, pids.csv) proving the cgroup limits.
+  plot.py          Renders the result figures (fig_dos/cpu/mem/pids .png).
+  README           This file.
+
+
+COMMUNICATIONS LIBRARY API  (cultnet.py)
+----------------------------------------
+Primitive: UNIX domain STREAM sockets (AF_UNIX, SOCK_STREAM) multiplexed in
+one server process with a non-blocking `selectors` (epoll) event loop.
+Messages are length-prefixed JSON frames: a 4-byte big-endian length followed
+by that many bytes of UTF-8 JSON. Peer identity comes from SO_PEERCRED.
+
+SERVER (class CultServer):
+    CultServer(sock_path, allowed_uids=None, one_per_uid=False,
+               sock_mode=0o660, max_frame=65536, out_max=1<<20,
+               partial_timeout=10.0)
+    .poll(timeout) -> [events]   pump the loop once; events are
+                                   ('connect', cid, uid)
+                                   ('message', cid, obj)
+                                   ('disconnect', cid)
+    .send(cid, obj)              UNICAST one JSON object to one connection
+    .multicast(cids, obj)        MULTICAST to a chosen subset
+    .broadcast(obj)              BROADCAST to every connection
+    .peers() -> [cid]            connected connection ids
+    .uid_of(cid) -> uid          kernel-verified UID of a connection
+    .close()                     shut down and remove the socket
+
+CLIENT (class CultClient):
+    CultClient(sock_path); .send(obj); .recv(timeout=None) -> obj; .close()
+
+
+SETUP (Ubuntu 26.04 VM, cgroup v2, with sudo)
+---------------------------------------------
+From inside the unpacked source directory:
+
+    sudo ./install.sh 6
+
+This creates cultmaster, players player0..player5 (each in the 'cult'
+group), the UID allowlist, and the delegated cgroup parent. If the host is
+not cgroup v2 the sandbox still runs seccomp-only and says so.
+
+After a reboot, re-prepare the cgroup parent:   sudo ./setup_cgroups.sh
+
+
+PLAYING (under the isolation sandbox)
+-------------------------------------
+1. Start the server as cultmaster:
+       sudo -u cultmaster bash -c 'cd /home/cultmaster && python3 cultserver.py'
+
+2. For each player, in its own terminal, join THROUGH the sandbox:
+       sudo -u player0 python3 /home/player0/cultsandbox.py \
+            --sock /home/cultmaster/cult.sock --name player0
+   (defaults: cpu 20%, mem 128 MB, pids 64; override with --cpu/--mem/--pids)
+
+Type to chat; actions are  pitch/check/vote <name>.
+
+
+QUICK LOCAL DEMO (one user, no install)
+---------------------------------------
+    python3 cultserver.py democonfig &
+    ./rundemo.sh 5          # 5 bots play a full game on a local /tmp socket
+
+
+TESTING THE ISOLATION (produces the figures)
+--------------------------------------------
+    sudo python3 setup_cgroups.sh         # once, on the cgroup-v2 VM
+    sudo python3 measure.py all           # writes cpu.csv, mem.csv, pids.csv
+    python3 plot.py . .                   # renders fig_cpu/mem/pids .png
+
+Seccomp can be tested with no cgroups at all:
+    python3 cultsandbox.py --no-cgroup --victim execshell   # killed (SIGSYS)
+    python3 cultsandbox.py --no-cgroup --victim ptrace      # killed (SIGSYS)
+
+
+WHY THIS IS SAFER THAN PROJECT 1
+--------------------------------
+  * Non-blocking event loop: one slow/oversized/slowloris client can no
+    longer freeze the single server thread (the Project 1 DoS).
+  * SO_PEERCRED is now an access gate: only allowlisted player UIDs connect,
+    at most one connection per UID, over a 0660 (not 0777) socket.
+  * cgroups v2: a busy/fork-bombing/memory-bombing player is capped inside
+    its own control group and cannot starve the server or the machine.
+  * seccomp-BPF: a compromised client cannot exec a shell, ptrace, load
+    kernel modules, mount filesystems, etc. -- it is confined to its socket.
+
+
+UNINSTALL
+---------
+    sudo ./uninstall.sh 6
